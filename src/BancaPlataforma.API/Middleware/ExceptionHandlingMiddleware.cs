@@ -1,5 +1,6 @@
 ﻿using BancaPlataforma.Domain.Exceptions;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 
 namespace BancaPlataforma.API.Middleware;
 
@@ -12,6 +13,12 @@ public sealed class ExceptionHandlingMiddleware(
         try
         {
             await next(context);
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            logger.LogWarning(ex, "Conflito de concorrência detectado");
+            await EscreverRespostaAsync(context, StatusCodes.Status409Conflict,
+                "Conflito de concorrência, tente novamente.");
         }
         catch (DomainException ex)
         {

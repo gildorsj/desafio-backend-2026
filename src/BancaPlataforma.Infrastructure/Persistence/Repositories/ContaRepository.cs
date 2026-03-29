@@ -27,4 +27,7 @@ public sealed class ContaRepository(BancaDbContext context) : IContaRepository
         // Não faz nada — o EF Core rastreia automaticamente
         // as mudanças feitas na entidade carregada pelo ObterPorIdAsync
     }
+    
+    public Task<bool> ExisteTransacaoPorIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct) =>
+        context.Transacoes.AnyAsync(t => t.IdempotencyKey == idempotencyKey, ct);
 }

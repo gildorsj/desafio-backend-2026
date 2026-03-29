@@ -9,4 +9,5 @@ public interface IContaRepository
     Task<bool> ExistePorCnpjAsync(string cnpj, CancellationToken ct = default);
     Task AdicionarAsync(Conta conta, CancellationToken ct = default);
     void Atualizar(Conta conta);
+    Task<bool> ExisteTransacaoPorIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct = default);
 }

@@ -1,226 +1,120 @@
-# Plataforma Bancária — Desafio Backend .NET
+# Fix: DbUpdateConcurrencyException on Financial Operations
 
-API REST para gerenciamento de contas bancárias corporativas (CNPJ), construída com .NET 8, DDD, CQRS e arquitetura orientada a eventos.
+## Context
 
----
+Financial operations (Depositar, Sacar, Transferir) are crashing with `DbUpdateConcurrencyException`, returning HTTP 500. Two distinct concurrency bugs exist:
 
-## Tecnologias
+**Bug 1 (immediate crash)**: TOCTOU race condition in idempotency service. Two concurrent requests with the same `IdempotencyKey` both pass the Redis pre-check (key not yet registered). Both proceed to INSERT a `Transacao` with the same unique `idempotency_key`. The unique constraint violation (Postgres 23505) aborts the entire transaction batch. Npgsql then sees 0 rows affected for the `UPDATE contas` command (because the batch was already aborted), and throws `DbUpdateConcurrencyException` — even though the root cause is a duplicate-key insertion, not a real concurrency conflict.
 
-| Tecnologia | Uso |
+**Bug 2 (silent data corruption)**: Without a concurrency token on `Conta`, two concurrent requests with **different** idempotency keys on the same account (e.g., two simultaneous deposits) cause a lost update. Both load `saldo = 100`, both apply their delta locally, and the second `SaveChangesAsync` silently overwrites the first. Expected balance: 200; actual balance: 150.
+
+## Solution
+
+### 1. Add DB-level idempotency pre-check to all financial handlers
+
+Before loading the `Conta`, check whether a `Transacao` with the given `idempotency_key` already exists in PostgreSQL. This is the ground truth — the unique index on `transacoes.idempotency_key` is the final arbiter. This eliminates the TOCTOU window that causes the constraint collision, because the check happens at the same DB tier as the INSERT.
+
+Add `ExisteTransacaoPorIdempotencyKeyAsync(string key, CancellationToken ct)` to `IContaRepository` and implement it in `ContaRepository`.
+
+Updated handler flow:
+```
+if (Redis.Existe(key)) return;          // fast path
+if (DB.ExisteTransacao(key)) {          // ground truth
+    Redis.Registrar(key);               // sync cache
+    return;
+}
+conta = Repo.ObterPorId(...)
+conta.Depositar(...)
+unitOfWork.CommitAsync()                // constraint collision can no longer happen
+Redis.Registrar(key)
+```
+
+### 2. Add `xmin` optimistic concurrency token to `Conta`
+
+Use Npgsql's `UseXminAsConcurrencyToken()` on the `Conta` entity configuration. This maps PostgreSQL's built-in `xmin` system column (the transaction ID of the last row modification) as a concurrency token. EF Core generates `UPDATE contas SET ... WHERE id = @id AND xmin = @originalXmin`. If another transaction modified the row in between, `xmin` changes, 0 rows are affected, and `DbUpdateConcurrencyException` is thrown — correctly this time. No DDL migration is needed (the column always exists in Postgres), but a model snapshot migration is required.
+
+### 3. Handle `DbUpdateConcurrencyException` in ExceptionHandlingMiddleware
+
+Add an explicit catch for `DbUpdateConcurrencyException` that returns **HTTP 409 Conflict** with an actionable message ("Conflito de concorrência, tente novamente."). This prevents it from falling through to the generic 500 handler. Clients that receive 409 on a financial operation should retry.
+
+## Critical Files
+
+| File | Change |
 |---|---|
-| .NET 8 / ASP.NET Core | Runtime e API REST |
-| Entity Framework Core 8 | ORM — Write Model (PostgreSQL) |
-| PostgreSQL | Banco de dados de escrita |
-| MongoDB | Banco de dados de leitura (projeções) |
-| RabbitMQ + MassTransit 8.x | Message broker — Domain Events |
-| Redis | Cache (ReceitaWS) + Idempotência |
-| MediatR 14 | Implementação de CQRS |
-| FluentValidation 12 | Validação de commands |
-| Polly | Resiliência nas chamadas à ReceitaWS |
-| Serilog | Logging estruturado |
-| Swagger/OpenAPI | Documentação da API |
-| Docker + Docker Compose | Orquestração de serviços |
+| `src/BancaPlataforma.Application/Common/Interfaces/IContaRepository.cs` | Add `ExisteTransacaoPorIdempotencyKeyAsync` |
+| `src/BancaPlataforma.Infrastructure/Persistence/Repositories/ContaRepository.cs` | Implement the above |
+| `src/BancaPlataforma.Infrastructure/Persistence/Configurations/ContaConfiguration.cs` | Add `builder.UseXminAsConcurrencyToken()` |
+| `src/BancaPlataforma.Application/Accounts/Commands/Depositar/DepositarCommandHandler.cs` | Add DB idempotency pre-check |
+| `src/BancaPlataforma.Application/Accounts/Commands/Sacar/SacarCommandHandler.cs` | Add DB idempotency pre-check |
+| `src/BancaPlataforma.Application/Accounts/Commands/Transferir/TransferirCommandHandler.cs` | Add DB idempotency pre-check |
+| `src/BancaPlataforma.API/Middleware/ExceptionHandlingMiddleware.cs` | Catch `DbUpdateConcurrencyException` → 409 |
 
----
+### New files
+- New EF Core migration (model snapshot update for `xmin` token, no SQL changes)
 
-## Como executar
+## Implementation Details
 
-### Pré-requisitos
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop) instalado e rodando
-- Portas 8080, 5432, 27017, 5672, 15672 e 6379 disponíveis
-
-### Subir a aplicação
-
-```bash
-docker compose up --build
+### IContaRepository.cs
+```csharp
+Task<bool> ExisteTransacaoPorIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct = default);
 ```
 
-Todos os serviços sobem automaticamente. As migrations do PostgreSQL e os índices do MongoDB são aplicados na inicialização.
-
-### Acessar
-
-| Serviço | URL | Credenciais |
-|---|---|---|
-| Swagger UI | http://localhost:8080 | — |
-| HealthCheck | http://localhost:8080/health | — |
-| RabbitMQ Management | http://localhost:15672 | bancauser / bancapass |
-
----
-
-## Arquitetura
-
+### ContaRepository.cs
+```csharp
+public Task<bool> ExisteTransacaoPorIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct) =>
+    context.Transacoes.AnyAsync(t => t.IdempotencyKey == idempotencyKey, ct);
 ```
-src/
-├── BancaPlataforma.Domain/          # Entidades, Value Objects, Domain Events
-├── BancaPlataforma.Application/     # Commands, Queries, Handlers (CQRS)
-├── BancaPlataforma.Infrastructure/  # EF Core, MongoDB, RabbitMQ, Redis, ReceitaWS
-├── BancaPlataforma.API/             # Controllers, Swagger, Middleware
-└── BancaPlataforma.Worker/          # Consumer RabbitMQ → projeções MongoDB
-```
+Note: `context.Transacoes` requires adding `public DbSet<Transacao> Transacoes => Set<Transacao>();` to `BancaDbContext` — it already exists.
 
-### Fluxo de uma operação financeira
-
+### ContaConfiguration.cs
+```csharp
+// After existing builder calls:
+builder.UseXminAsConcurrencyToken();
 ```
-Client → API Controller
-  → Command Handler (MediatR)
-    → Aggregate valida regra de negócio
-      → SaveChangesAsync (transação única):
-          • Persiste no PostgreSQL (Write Model)
-          • Serializa Domain Events → tabela outbox_messages
-      → OutboxProcessor (BackgroundService, a cada 10s):
-          • Lê mensagens pendentes do outbox
-          • Publica no RabbitMQ via MassTransit
-          • Marca como processadas
-            → Worker consome o evento
-              → Projeta saldo e extrato no MongoDB (Read Model)
+This is an Npgsql extension method on `EntityTypeBuilder<Conta>`.
+
+### DepositarCommandHandler.cs (same pattern for Sacar)
+```csharp
+public async Task Handle(DepositarCommand request, CancellationToken ct)
+{
+    if (await idempotency.ExisteAsync(request.IdempotencyKey, ct))
+        return;
+ 
+    if (await repository.ExisteTransacaoPorIdempotencyKeyAsync(request.IdempotencyKey, ct))
+    {
+        await idempotency.RegistrarAsync(request.IdempotencyKey, ct);
+        return;
+    }
+ 
+    var conta = await repository.ObterPorIdAsync(request.ContaId, ct)
+                ?? throw new DomainException("Conta não encontrada.");
+ 
+    conta.Depositar(request.Valor, request.Moeda, request.Descricao, request.IdempotencyKey);
+ 
+    repository.Atualizar(conta);
+    await unitOfWork.CommitAsync(ct);
+    await idempotency.RegistrarAsync(request.IdempotencyKey, ct);
+}
 ```
 
-### Decisões arquiteturais
+### TransferirCommandHandler.cs
+Same DB idempotency pre-check added before loading both accounts.
 
-**DDD**
-- `Conta` é o Aggregate Root. Todo comportamento de negócio (depositar, sacar, transferir, encerrar) está encapsulado no agregado — nenhuma camada externa consegue colocar a entidade em estado inválido.
-- `CNPJ` e `Dinheiro` são Value Objects imutáveis com validação embutida.
-- Domain Events são levantados dentro do agregado e publicados após a persistência.
-
-**CQRS**
-- **Write Side**: comandos operam sobre o PostgreSQL via EF Core. O `DbContext` serializa os Domain Events para a tabela `outbox_messages` dentro da mesma transação do dado principal.
-- **Read Side**: queries consultam o MongoDB, que é atualizado de forma assíncrona pelo Worker após consumir os eventos do RabbitMQ.
-
-**Outbox Pattern**
-- Domain Events não são publicados diretamente no RabbitMQ — são persistidos na tabela `outbox_messages` na mesma transação ACID do dado principal, eliminando a janela de falha entre o commit e a publicação.
-- O `OutboxProcessor` (`BackgroundService`) roda na API, consulta a tabela a cada 10 segundos, desserializa cada mensagem pelo tipo assembly-qualified, publica no RabbitMQ via `IBus` do MassTransit e marca como processada.
-- Falhas de publicação são registradas no campo `Erro` da mensagem; a mensagem é marcada como processada para não bloquear a fila (reprocessamento pode ser adicionado via DLQ).
-
-**Idempotência**
-- Operações financeiras exigem um `idempotencyKey` fornecido pelo cliente.
-- A chave é armazenada no Redis com TTL de 7 dias.
-- Reenvios com a mesma chave retornam sucesso sem duplicar a operação.
-
-**Resiliência**
-- Chamadas à ReceitaWS usam Polly com retry exponencial (3 tentativas) e circuit breaker (5 falhas → 30s aberto).
-- MassTransit configurado com retry automático nas filas (3 tentativas com intervalos de 500ms, 1s e 2s).
-
-**Audit Log**
-- Toda alteração nas entidades `contas` e `transacoes` é registrada automaticamente na tabela `audit_logs` dentro da mesma transação do dado principal.
-- Capturado no `BancaDbContext.SaveChangesAsync` via EF Core `ChangeTracker`, antes do save (para preservar os valores originais).
-- Cada registro contém: tabela, ID da entidade, operação (`Criado` / `Atualizado` / `Removido`), valores anteriores e novos em `jsonb`, e timestamp.
-- `OutboxMessage` e `AuditLog` são excluídos da captura para evitar ruído e recursão.
-
-**Consistência eventual**
-- O saldo e extrato no MongoDB podem ter atraso mínimo em relação ao PostgreSQL — comportamento esperado e documentado na regra de negócio.
-
----
-
-## Endpoints
-
-### Contas
-
-| Método | Rota | Descrição |
-|---|---|---|
-| POST | /api/v1/accounts | Abrir conta |
-| GET | /api/v1/accounts/{id} | Obter conta por ID |
-| GET | /api/v1/accounts/cnpj/{cnpj} | Obter conta por CNPJ |
-| PATCH | /api/v1/accounts/{id}/status | Alterar status |
-| DELETE | /api/v1/accounts/{id} | Encerrar conta |
-
-### Operações financeiras
-
-| Método | Rota | Descrição |
-|---|---|---|
-| POST | /api/v1/accounts/{id}/deposit | Depósito |
-| POST | /api/v1/accounts/{id}/withdraw | Saque |
-| POST | /api/v1/accounts/{id}/transfer | Transferência |
-
-### Consultas (Read Model — MongoDB)
-
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | /api/v1/accounts/{id}/balance | Saldo |
-| GET | /api/v1/accounts/{id}/statement | Extrato paginado |
-
----
-
-## Testes
-
+### ExceptionHandlingMiddleware.cs
+```csharp
+catch (DbUpdateConcurrencyException ex)
+{
+    logger.LogWarning(ex, "Conflito de concorrência detectado");
+    await EscreverRespostaAsync(context, StatusCodes.Status409Conflict,
+        "Conflito de concorrência, tente novamente.");
+}
 ```
-tests/
-├── BancaPlataforma.UnitTests/        # xUnit + Moq + FluentAssertions
-└── BancaPlataforma.IntegrationTests/ # xUnit + Testcontainers + WebApplicationFactory
-```
+(Added before the generic `Exception` catch.)
 
-### Testes unitários
+## Verification
 
-Cobrem as camadas de **Domain** e **Application** de forma isolada, sem dependências externas.
-
-**Domain — Value Objects e Aggregate**
-
-| Classe de teste | Casos cobertos |
-|---|---|
-| `CnpjTests` | CNPJ válido/inválido, normalização de dígitos, formatação, igualdade por valor |
-| `DinheiroTests` | Criação, soma de mesma moeda, subtração com saldo insuficiente, moedas diferentes |
-| `ContaTests` | Abertura, depósito, saque, transferência, encerramento, bloqueio, regras de negócio |
-
-**Application — Command Handlers**
-
-| Classe de teste | Casos cobertos |
-|---|---|
-| `AbrirContaCommandHandlerTests` | CNPJ válido cria conta, CNPJ duplicado, ReceitaWS indisponível, CNPJ inativo |
-| `DepositarCommandHandlerTests` | Depósito com nova chave, idempotência duplicada, conta não encontrada |
-| `SacarCommandHandlerTests` | Saque com nova chave, idempotência duplicada, saldo insuficiente, conta não encontrada |
-| `TransferirCommandHandlerTests` | Transferência válida, idempotência duplicada, conta origem/destino não encontrada |
-| `AlterarStatusContaCommandHandlerTests` | Alteração válida, conta não encontrada, status inválido |
-| `EncerrarContaCommandHandlerTests` | Encerramento com saldo zero, encerramento com saldo, conta não encontrada |
-
-#### Executar testes unitários
-
-```bash
-dotnet test tests/BancaPlataforma.UnitTests
-```
-
-### Testes de integração
-
-Usam **Testcontainers** para subir instâncias reais de PostgreSQL, MongoDB e RabbitMQ em Docker durante a execução. A API é inicializada via `WebApplicationFactory<Program>` com as connection strings substituídas pelos containers de teste.
-
-**Requer Docker em execução.**
-
-| Classe de teste | Casos cobertos |
-|---|---|
-| `AccountsEndpointTests` | GET /health, POST /accounts (CNPJ inválido, campos faltando), GET por ID/CNPJ inexistentes, PATCH status inválido/conta inexistente, DELETE conta inexistente, POST deposit/withdraw/transfer em conta inexistente, GET balance/statement |
-
-#### Executar testes de integração
-
-```bash
-dotnet test tests/BancaPlataforma.IntegrationTests
-```
-
-#### Executar todos os testes
-
-```bash
-dotnet test
-```
-
----
-
-## Regras de negócio implementadas
-
-- CNPJ validado por dígito verificador e consultado na Receita Federal (ReceitaWS)
-- Razão Social obtida exclusivamente via ReceitaWS — nunca informada pelo usuário
-- Saldo nunca negativo — validado no agregado antes de publicar o evento
-- Conta bloqueada ou encerrada não aceita movimentações
-- Encerramento apenas com saldo zero (soft delete)
-- Transferência exige ambas as contas com status `Ativa`
-- Idempotência em todas as operações financeiras via Redis
-
----
-
-## Melhorias futuras
-
-- **Autenticação e autorização** — JWT com escopos por operação
-- **Audit Log — usuário** — adicionar o campo `UsuarioId` ao registro quando autenticação for implementada
-- **Dead Letter Queue** — fila de mensagens com falha para reprocessamento manual
-- **Paginação no GET /accounts** — listagem de contas com filtros
-- **Audit log** — rastreabilidade completa de todas as operações
-- **Rate limiting** — proteção contra abuso dos endpoints financeiros
-- **Compressão de resposta** — Brotli/Gzip para reduzir payload
-- **Cache de leitura** — Redis para cachear consultas de saldo frequentes
+1. Run the application and send two concurrent `POST /api/v1/accounts/{id}/deposit` requests with the **same** `IdempotencyKey` at the same time — should return 204 for first, 204 for second (idempotent, no 500).
+2. Send two concurrent deposits with **different** idempotency keys — one may return 409 (xmin conflict); client retries and gets 204. Final balance should reflect both deposits.
+3. Run existing tests: `dotnet test`.
+4. Run the migration: `dotnet ef migrations add AddXminConcurrencyToken --project src/BancaPlataforma.Infrastructure --startup-project src/BancaPlataforma.API`.
+5. Apply: `dotnet ef database update`.

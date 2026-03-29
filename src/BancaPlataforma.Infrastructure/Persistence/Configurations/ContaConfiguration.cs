@@ -73,5 +73,7 @@ public sealed class ContaConfiguration : IEntityTypeConfiguration<Conta>
             .WithOne()
             .HasForeignKey(t => t.ContaId)
             .OnDelete(DeleteBehavior.Cascade);
+        
+        builder.UseXminAsConcurrencyToken();
     }
 }
