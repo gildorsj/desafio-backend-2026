@@ -65,10 +65,15 @@ src/
 Client → API Controller
   → Command Handler (MediatR)
     → Aggregate valida regra de negócio
-      → Persiste no PostgreSQL (Write Model)
-        → Domain Event publicado via MassTransit → RabbitMQ
-          → Worker consome o evento
-            → Projeta saldo e extrato no MongoDB (Read Model)
+      → SaveChangesAsync (transação única):
+          • Persiste no PostgreSQL (Write Model)
+          • Serializa Domain Events → tabela outbox_messages
+      → OutboxProcessor (BackgroundService, a cada 10s):
+          • Lê mensagens pendentes do outbox
+          • Publica no RabbitMQ via MassTransit
+          • Marca como processadas
+            → Worker consome o evento
+              → Projeta saldo e extrato no MongoDB (Read Model)
 ```
 
 ### Decisões arquiteturais
@@ -79,8 +84,13 @@ Client → API Controller
 - Domain Events são levantados dentro do agregado e publicados após a persistência.
 
 **CQRS**
-- **Write Side**: comandos operam sobre o PostgreSQL via EF Core. O `DbContext` publica os Domain Events após o `SaveChanges`.
+- **Write Side**: comandos operam sobre o PostgreSQL via EF Core. O `DbContext` serializa os Domain Events para a tabela `outbox_messages` dentro da mesma transação do dado principal.
 - **Read Side**: queries consultam o MongoDB, que é atualizado de forma assíncrona pelo Worker após consumir os eventos do RabbitMQ.
+
+**Outbox Pattern**
+- Domain Events não são publicados diretamente no RabbitMQ — são persistidos na tabela `outbox_messages` na mesma transação ACID do dado principal, eliminando a janela de falha entre o commit e a publicação.
+- O `OutboxProcessor` (`BackgroundService`) roda na API, consulta a tabela a cada 10 segundos, desserializa cada mensagem pelo tipo assembly-qualified, publica no RabbitMQ via `IBus` do MassTransit e marca como processada.
+- Falhas de publicação são registradas no campo `Erro` da mensagem; a mensagem é marcada como processada para não bloquear a fila (reprocessamento pode ser adicionado via DLQ).
 
 **Idempotência**
 - Operações financeiras exigem um `idempotencyKey` fornecido pelo cliente.
@@ -201,7 +211,6 @@ dotnet test
 ## Melhorias futuras
 
 - **Autenticação e autorização** — JWT com escopos por operação
-- **Outbox Pattern** — garantir entrega dos Domain Events mesmo em caso de falha do RabbitMQ antes da publicação
 - **Dead Letter Queue** — fila de mensagens com falha para reprocessamento manual
 - **Paginação no GET /accounts** — listagem de contas com filtros
 - **Audit log** — rastreabilidade completa de todas as operações

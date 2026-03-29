@@ -1,17 +1,17 @@
-﻿using BancaPlataforma.Domain.Aggregates;
+using BancaPlataforma.Domain.Aggregates;
 using BancaPlataforma.Domain.Entities;
 using BancaPlataforma.Domain.Primitives;
-using MediatR;
+using BancaPlataforma.Infrastructure.Outbox;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 namespace BancaPlataforma.Infrastructure.Persistence;
 
-public sealed class BancaDbContext(
-    DbContextOptions<BancaDbContext> options,
-    IPublisher publisher) : DbContext(options)
+public sealed class BancaDbContext(DbContextOptions<BancaDbContext> options) : DbContext(options)
 {
     public DbSet<Conta> Contas => Set<Conta>();
     public DbSet<Transacao> Transacoes => Set<Transacao>();
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -19,15 +19,13 @@ public sealed class BancaDbContext(
         base.OnModelCreating(modelBuilder);
     }
 
-    // Publica domain events após salvar no banco
     public override async Task<int> SaveChangesAsync(CancellationToken ct = default)
     {
-        var result = await base.SaveChangesAsync(ct);
-        await PublicarDomainEventsAsync(ct);
-        return result;
+        SerializarDomainEventsParaOutbox();
+        return await base.SaveChangesAsync(ct);
     }
 
-    private async Task PublicarDomainEventsAsync(CancellationToken ct)
+    private void SerializarDomainEventsParaOutbox()
     {
         var aggregates = ChangeTracker
             .Entries<AggregateRoot>()
@@ -35,13 +33,20 @@ public sealed class BancaDbContext(
             .Where(a => a.DomainEvents.Any())
             .ToList();
 
-        var events = aggregates
+        var mensagens = aggregates
             .SelectMany(a => a.DomainEvents)
+            .Select(evento => new OutboxMessage
+            {
+                Id = Guid.NewGuid(),
+                Tipo = evento.GetType().AssemblyQualifiedName!,
+                Payload = JsonSerializer.Serialize(evento, evento.GetType()),
+                CriadoEm = DateTime.UtcNow
+            })
             .ToList();
 
         aggregates.ForEach(a => a.ClearDomainEvents());
 
-        foreach (var domainEvent in events)
-            await publisher.Publish(domainEvent, ct);
+        if (mensagens.Count > 0)
+            OutboxMessages.AddRange(mensagens);
     }
 }

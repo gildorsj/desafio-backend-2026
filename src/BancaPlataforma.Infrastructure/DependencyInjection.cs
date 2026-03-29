@@ -2,6 +2,7 @@
 using BancaPlataforma.Application.Common.Interfaces;
 using BancaPlataforma.Infrastructure.ExternalServices;
 using BancaPlataforma.Infrastructure.Idempotency;
+using BancaPlataforma.Infrastructure.Outbox;
 using BancaPlataforma.Infrastructure.Persistence;
 using BancaPlataforma.Infrastructure.Persistence.Repositories;
 using BancaPlataforma.Infrastructure.ReadModel.Repositories;
@@ -42,6 +43,7 @@ public static class DependencyInjection
             opts.Configuration = configuration.GetConnectionString("Redis"));
 
         services.AddScoped<IIdempotencyService, RedisIdempotencyService>();
+        services.AddHostedService<OutboxProcessor>();
 
         // ── ReceitaWS ────────────────────────────────
         services.AddHttpClient<IReceitaWsService, ReceitaWsService>(client =>
