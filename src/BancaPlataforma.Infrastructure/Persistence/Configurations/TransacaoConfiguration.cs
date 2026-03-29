@@ -15,7 +15,7 @@ public sealed class TransacaoConfiguration : IEntityTypeConfiguration<Transacao>
 
         builder.Property(t => t.ContaId).HasColumnName("conta_id").IsRequired();
 
-        builder.OwnsOne(t => t.Valor, v =>
+        builder.ComplexProperty(t => t.Valor, v =>
         {
             v.Property(x => x.Valor)
                 .HasColumnName("valor")

@@ -24,15 +24,50 @@ public sealed class BancaDbContext(DbContextOptions<BancaDbContext> options) : D
 
     public override async Task<int> SaveChangesAsync(CancellationToken ct = default)
     {
-        // Captura auditoria antes do save para ter os valores originais disponíveis
-        var auditorias = CapturarAuditoria();
+        // DetectChanges explícito + desabilita o auto-detect para evitar que
+        // chamadas a ChangeTracker.Entries() durante o processamento customizado
+        // disparem DetectChanges adicionais e corrompam o estado das owned entities.
+        ChangeTracker.AutoDetectChangesEnabled = false;
+        try
+        {
+            ChangeTracker.DetectChanges();
 
-        SerializarDomainEventsParaOutbox();
+            RastrearNovasTransacoes();
 
-        if (auditorias.Count > 0)
-            AuditLogs.AddRange(auditorias);
+            var auditorias = CapturarAuditoria();
+            SerializarDomainEventsParaOutbox();
 
-        return await base.SaveChangesAsync(ct);
+            if (auditorias.Count > 0)
+                AuditLogs.AddRange(auditorias);
+
+            return await base.SaveChangesAsync(ct);
+        }
+        finally
+        {
+            ChangeTracker.AutoDetectChangesEnabled = true;
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Rastreamento de transações
+    // ──────────────────────────────────────────
+
+    private void RastrearNovasTransacoes()
+    {
+        var contas = ChangeTracker
+            .Entries<Conta>()
+            .Select(e => e.Entity)
+            .ToList();
+
+        foreach (var conta in contas)
+        {
+            foreach (var transacao in conta.Transacoes)
+            {
+                var entry = Entry(transacao);
+                if (entry.State == EntityState.Detached)
+                    Transacoes.Add(transacao);
+            }
+        }
     }
 
     // ──────────────────────────────────────────
@@ -73,6 +108,7 @@ public sealed class BancaDbContext(DbContextOptions<BancaDbContext> options) : D
         var entradas = ChangeTracker.Entries()
             .Where(e => e.Entity is not AuditLog
                      && e.Entity is not OutboxMessage
+                     && !e.Metadata.IsOwned()   // owned entities são salvas pelo owner
                      && e.State is EntityState.Added
                                 or EntityState.Modified
                                 or EntityState.Deleted)

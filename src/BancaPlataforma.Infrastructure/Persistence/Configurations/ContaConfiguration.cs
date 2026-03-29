@@ -26,7 +26,11 @@ public sealed class ContaConfiguration : IEntityTypeConfiguration<Conta>
         });
 
         // Value Object: Saldo
-        builder.OwnsOne(c => c.Saldo, saldo =>
+        // ComplexProperty (EF Core 8) trata Dinheiro como tipo-valor puro:
+        // rastreia os VALORES (saldo/moeda), não a referência da instância.
+        // Isso evita o DbUpdateConcurrencyException causado pelo rastreamento
+        // de entidades órfãs quando Conta.Saldo é substituído por nova instância.
+        builder.ComplexProperty(c => c.Saldo, saldo =>
         {
             saldo.Property(s => s.Valor)
                 .HasColumnName("saldo")
