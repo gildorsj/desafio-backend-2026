@@ -24,9 +24,7 @@ public sealed class ContaRepository(BancaDbContext context) : IContaRepository
 
     public void Atualizar(Conta conta)
     {
-        // Se já está sendo rastreado, não precisa fazer nada
-        // O EF Core detecta as mudanças automaticamente
-        if (context.Entry(conta).State == EntityState.Detached)
-            context.Contas.Update(conta);
+        // Não faz nada — o EF Core rastreia automaticamente
+        // as mudanças feitas na entidade carregada pelo ObterPorIdAsync
     }
 }

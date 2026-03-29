@@ -101,6 +101,12 @@ Client → API Controller
 - Chamadas à ReceitaWS usam Polly com retry exponencial (3 tentativas) e circuit breaker (5 falhas → 30s aberto).
 - MassTransit configurado com retry automático nas filas (3 tentativas com intervalos de 500ms, 1s e 2s).
 
+**Audit Log**
+- Toda alteração nas entidades `contas` e `transacoes` é registrada automaticamente na tabela `audit_logs` dentro da mesma transação do dado principal.
+- Capturado no `BancaDbContext.SaveChangesAsync` via EF Core `ChangeTracker`, antes do save (para preservar os valores originais).
+- Cada registro contém: tabela, ID da entidade, operação (`Criado` / `Atualizado` / `Removido`), valores anteriores e novos em `jsonb`, e timestamp.
+- `OutboxMessage` e `AuditLog` são excluídos da captura para evitar ruído e recursão.
+
 **Consistência eventual**
 - O saldo e extrato no MongoDB podem ter atraso mínimo em relação ao PostgreSQL — comportamento esperado e documentado na regra de negócio.
 
@@ -211,6 +217,7 @@ dotnet test
 ## Melhorias futuras
 
 - **Autenticação e autorização** — JWT com escopos por operação
+- **Audit Log — usuário** — adicionar o campo `UsuarioId` ao registro quando autenticação for implementada
 - **Dead Letter Queue** — fila de mensagens com falha para reprocessamento manual
 - **Paginação no GET /accounts** — listagem de contas com filtros
 - **Audit log** — rastreabilidade completa de todas as operações
