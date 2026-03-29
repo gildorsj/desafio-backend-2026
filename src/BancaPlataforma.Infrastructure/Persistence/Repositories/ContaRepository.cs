@@ -22,6 +22,11 @@ public sealed class ContaRepository(BancaDbContext context) : IContaRepository
     public async Task AdicionarAsync(Conta conta, CancellationToken ct) =>
         await context.Contas.AddAsync(conta, ct);
 
-    public void Atualizar(Conta conta) =>
-        context.Contas.Update(conta);
+    public void Atualizar(Conta conta)
+    {
+        // Se já está sendo rastreado, não precisa fazer nada
+        // O EF Core detecta as mudanças automaticamente
+        if (context.Entry(conta).State == EntityState.Detached)
+            context.Contas.Update(conta);
+    }
 }
