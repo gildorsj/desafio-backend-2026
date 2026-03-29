@@ -1,0 +1,6 @@
+@BancaPlataforma.API_HostAddress = http://localhost:5224
+
+GET {{BancaPlataforma.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

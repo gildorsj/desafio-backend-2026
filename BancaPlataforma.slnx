@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BancaPlataforma.API/BancaPlataforma.API.csproj" />
+    <Project Path="src/BancaPlataforma.Application/BancaPlataforma.Application.csproj" />
+    <Project Path="src/BancaPlataforma.Domain/BancaPlataforma.Domain.csproj" />
+    <Project Path="src/BancaPlataforma.Infrastructure/BancaPlataforma.Infrastructure.csproj" />
+    <Project Path="src/BancaPlataforma.Worker/BancaPlataforma.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BancaPlataforma.IntegrationTests/BancaPlataforma.IntegrationTests.csproj" />
+    <Project Path="tests/BancaPlataforma.UnitTests/BancaPlataforma.UnitTests.csproj" />
+  </Folder>
+</Solution>

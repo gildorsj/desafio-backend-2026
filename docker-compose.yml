@@ -1,0 +1,162 @@
+services:
+
+  # ──────────────────────────────────────────
+  # INFRAESTRUTURA
+  # ──────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bancaplataforma_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bancaplataforma
+      POSTGRES_USER: bancauser
+      POSTGRES_PASSWORD: bancapass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bancauser -d bancaplataforma"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    container_name: bancaplataforma_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: bancauser
+      MONGO_INITDB_ROOT_PASSWORD: bancapass
+      MONGO_INITDB_DATABASE: bancaplataforma_read
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: bancaplataforma_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: bancauser
+      RABBITMQ_DEFAULT_PASS: bancapass
+      RABBITMQ_DEFAULT_VHOST: bancaplataforma
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: bancaplataforma_redis
+    restart: unless-stopped
+    command: redis-server --requirepass bancapass
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "bancapass", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────
+  # APLICAÇÃO
+  # ──────────────────────────────────────────
+
+  api:
+    build:
+      context: .
+      dockerfile: src/BancaPlataforma.API/Dockerfile
+    container_name: bancaplataforma_api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+
+      # PostgreSQL
+      ConnectionStrings__PostgreSQL: "Host=postgres;Port=5432;Database=bancaplataforma;Username=bancauser;Password=bancapass"
+
+      # MongoDB
+      ConnectionStrings__MongoDB: "mongodb://bancauser:bancapass@mongodb:27017/bancaplataforma_read?authSource=admin"
+      MongoDB__DatabaseName: bancaplataforma_read
+
+      # RabbitMQ
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__VirtualHost: bancaplataforma
+      RabbitMQ__Username: bancauser
+      RabbitMQ__Password: bancapass
+
+      # Redis
+      ConnectionStrings__Redis: "redis:6379,password=bancapass"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/BancaPlataforma.Worker/Dockerfile
+    container_name: bancaplataforma_worker
+    restart: unless-stopped
+    environment:
+      DOTNET_ENVIRONMENT: Development
+
+      # PostgreSQL (para fallback/auditoria se necessário)
+      ConnectionStrings__PostgreSQL: "Host=postgres;Port=5432;Database=bancaplataforma;Username=bancauser;Password=bancapass"
+
+      # MongoDB (escrita das projeções)
+      ConnectionStrings__MongoDB: "mongodb://bancauser:bancapass@mongodb:27017/bancaplataforma_read?authSource=admin"
+      MongoDB__DatabaseName: bancaplataforma_read
+
+      # RabbitMQ
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__VirtualHost: bancaplataforma
+      RabbitMQ__Username: bancauser
+      RabbitMQ__Password: bancapass
+
+      # Redis
+      ConnectionStrings__Redis: "redis:6379,password=bancapass"
+
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+# ──────────────────────────────────────────
+# VOLUMES
+# ──────────────────────────────────────────
+
+volumes:
+  postgres_data:
+  mongo_data:
+  rabbitmq_data:
+  redis_data:
